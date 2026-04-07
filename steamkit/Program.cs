@@ -1145,12 +1145,60 @@ static async Task<string> FetchSteamCommunityWebApiTokenAsync(string proxyUrl, s
 
 static async Task<List<SteamInventoryItem>> FetchFullSteamInventoryAsync(string proxyUrl, string steamId64, string steamWebCookie, int count)
 {
+    // 1) обычный кейс: сначала пытаемся через context 2
+    var items = await FetchFullSteamInventoryForContextAsync(
+        proxyUrl,
+        steamId64,
+        steamWebCookie,
+        count,
+        "2"
+    ).ConfigureAwait(false);
+
+    if (items.Count > 0)
+    {
+        return items;
+    }
+
+    // 2) fallback: если 2 пустой — пробуем 16
+    Log("steam/inventory:fallback_context", new
+    {
+        steamid64 = steamId64,
+        from_context = "2",
+        to_context = "16",
+    });
+
+    items = await FetchFullSteamInventoryForContextAsync(
+        proxyUrl,
+        steamId64,
+        steamWebCookie,
+        count,
+        "16"
+    ).ConfigureAwait(false);
+
+    return items;
+}
+
+static async Task<List<SteamInventoryItem>> FetchFullSteamInventoryForContextAsync(
+    string proxyUrl,
+    string steamId64,
+    string steamWebCookie,
+    int count,
+    string contextId)
+{
     var allItems = new List<SteamInventoryItem>();
     string? startAssetId = null;
 
     for (var page = 0; page < 10; page++)
     {
-        var result = await FetchSteamInventoryPageAsync(proxyUrl, steamId64, steamWebCookie, count, startAssetId).ConfigureAwait(false);
+        var result = await FetchSteamInventoryPageAsync(
+            proxyUrl,
+            steamId64,
+            steamWebCookie,
+            count,
+            startAssetId,
+            contextId
+        ).ConfigureAwait(false);
+
         if (result.Items.Count > 0)
         {
             allItems.AddRange(result.Items);
@@ -1164,14 +1212,27 @@ static async Task<List<SteamInventoryItem>> FetchFullSteamInventoryAsync(string 
         startAssetId = result.LastAssetId;
     }
 
+    Log("steam/inventory:context_done", new
+    {
+        steamid64 = steamId64,
+        contextid = contextId,
+        count = allItems.Count,
+    });
+
     return allItems;
 }
 
-static async Task<SteamInventoryPageResult> FetchSteamInventoryPageAsync(string proxyUrl, string steamId64, string steamWebCookie, int count, string? startAssetId)
+static async Task<SteamInventoryPageResult> FetchSteamInventoryPageAsync(
+    string proxyUrl,
+    string steamId64,
+    string steamWebCookie,
+    int count,
+    string? startAssetId,
+    string contextId)
 {
     using var http = CreateProxiedHttpClient(proxyUrl, TimeSpan.FromSeconds(45));
 
-    var url = $"https://steamcommunity.com/inventory/{steamId64}/730/2?l=english&count={count}";
+    var url = $"https://steamcommunity.com/inventory/{steamId64}/730/{contextId}?l=english&count={count}";
     if (!string.IsNullOrWhiteSpace(startAssetId))
     {
         url += $"&start_assetid={Uri.EscapeDataString(startAssetId)}";
@@ -1191,7 +1252,9 @@ static async Task<SteamInventoryPageResult> FetchSteamInventoryPageAsync(string 
 
     if (!response.IsSuccessStatusCode)
     {
-        throw new InvalidOperationException($"Steam inventory failed: HTTP {(int)response.StatusCode} {response.ReasonPhrase}; body={(body.Length > 400 ? body[..400] : body)}");
+        throw new InvalidOperationException(
+            $"Steam inventory failed: context={contextId}; HTTP {(int)response.StatusCode} {response.ReasonPhrase}; body={(body.Length > 400 ? body[..400] : body)}"
+        );
     }
 
     using var doc = JsonDocument.Parse(body);
@@ -1234,6 +1297,7 @@ static async Task<SteamInventoryPageResult> FetchSteamInventoryPageAsync(string 
                 AssetId = TryGetString(asset, "assetid"),
                 ClassId = classId,
                 InstanceId = instanceId,
+                ContextId = TryGetString(asset, "contextid") ?? contextId,
                 Amount = ParseIntSafe(TryGetString(asset, "amount")),
                 MarketHashName = desc?.MarketHashName ?? string.Empty,
                 Name = desc?.Name ?? string.Empty,
@@ -1256,6 +1320,16 @@ static async Task<SteamInventoryPageResult> FetchSteamInventoryPageAsync(string 
     }
 
     var lastAssetId = TryGetString(root, "last_assetid");
+
+    Log("steam/inventory:page", new
+    {
+        steamid64 = steamId64,
+        contextid = contextId,
+        page_items = items.Count,
+        more_items = moreItems,
+        last_assetid = lastAssetId,
+    });
+
     return new SteamInventoryPageResult(items, moreItems, lastAssetId);
 }
 
@@ -2289,6 +2363,9 @@ internal sealed class SteamInventoryItem
 
     [JsonPropertyName("instanceid")]
     public string? InstanceId { get; set; }
+
+    [JsonPropertyName("contextid")]
+    public string? ContextId { get; set; }
 
     [JsonPropertyName("amount")]
     public int Amount { get; set; }
